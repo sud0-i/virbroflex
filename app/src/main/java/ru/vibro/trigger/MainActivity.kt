@@ -60,6 +60,7 @@ class MainActivity : Activity() {
     private lateinit var settingsBtn: Button
     private lateinit var statsText: TextView
     private lateinit var schedInfo: TextView
+    private lateinit var slotBox: LinearLayout
     private lateinit var trackInfo: TextView
 
     private val match = ViewGroup.LayoutParams.MATCH_PARENT
@@ -191,55 +192,10 @@ class MainActivity : Activity() {
         // Расписание
         val sch = panel(root, "Расписание")
         sch.addView(check("Реагировать только в заданное время", "schedOn", false), lp(6))
-        val times = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        lateinit var fromBtn: Button
-        lateinit var toBtn: Button
-        fromBtn = button(fmtTime(prefs.getInt("from", 540))) { pickTime("from", 540, fromBtn) }
-        toBtn = button(fmtTime(prefs.getInt("to", 840))) { pickTime("to", 840, toBtn) }
-        times.addView(tv("С", 15f, TEXT))
-        times.addView(fromBtn, LinearLayout.LayoutParams(0, wrap, 1f).apply { leftMargin = dp(8); rightMargin = dp(12) })
-        times.addView(tv("до", 15f, TEXT))
-        times.addView(toBtn, LinearLayout.LayoutParams(0, wrap, 1f).apply { leftMargin = dp(8) })
-        sch.addView(times, lp(8))
-
-        val dayRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        for ((name, bit) in DAYS) {
-            val tb = ToggleButton(this).apply {
-                textOn = name
-                textOff = name
-                textSize = 13f
-                minWidth = 0
-                minimumWidth = 0
-                minHeight = 0
-                minimumHeight = 0
-                setPadding(0, dp(10), 0, dp(10))
-                stateListAnimator = null
-                background = StateListDrawable().apply {
-                    addState(intArrayOf(android.R.attr.state_checked), GradientDrawable().apply {
-                        setColor(ACCENT); cornerRadius = dp(6).toFloat()
-                    })
-                    addState(intArrayOf(), GradientDrawable().apply {
-                        setColor(PANEL); setStroke(dp(1), LINE); cornerRadius = dp(6).toFloat()
-                    })
-                }
-                setTextColor(
-                    ColorStateList(
-                        arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
-                        intArrayOf(DARK, MUTED)
-                    )
-                )
-                isChecked = (prefs.getInt("days", 0x7F) and (1 shl bit)) != 0
-                setOnCheckedChangeListener { _, c ->
-                    val d = prefs.getInt("days", 0x7F)
-                    prefs.edit().putInt("days", if (c) d or (1 shl bit) else d and (1 shl bit).inv()).apply()
-                }
-            }
-            dayRow.addView(tb, LinearLayout.LayoutParams(0, wrap, 1f).apply { leftMargin = dp(2); rightMargin = dp(2) })
-        }
-        sch.addView(dayRow, lp(10))
+        slotBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        sch.addView(slotBox, lp(4))
+        rebuildSlots()
+        sch.addView(button("+ Добавить отрезок") { addSlot() }, lp(10))
         schedInfo = tv("", 13f, MUTED)
         sch.addView(schedInfo, lp(10))
 
@@ -357,12 +313,119 @@ class MainActivity : Activity() {
         ui.post(r)
     }
 
-    private fun pickTime(key: String, def: Int, b: Button) {
-        val v = prefs.getInt(key, def)
-        TimePickerDialog(this, { _, h, m ->
-            prefs.edit().putInt(key, h * 60 + m).apply()
-            b.text = fmtTime(h * 60 + m)
-        }, v / 60, v % 60, true).show()
+    // ---------- Расписание ----------
+
+    private fun rebuildSlots() {
+        slotBox.removeAllViews()
+        val slots = Slot.load(prefs)
+        if (slots.isEmpty()) {
+            slotBox.addView(tv("Нет ни одного отрезка. Добавьте хотя бы один.", 13f, MUTED), lp(8))
+            return
+        }
+        slots.forEachIndexed { i, slot -> slotBox.addView(slotView(i, slot), lp(8)) }
+    }
+
+    private fun updateSlot(i: Int, f: (Slot) -> Slot) {
+        val list = Slot.load(prefs).toMutableList()
+        if (i !in list.indices) return
+        list[i] = f(list[i])
+        Slot.save(prefs, list)
+    }
+
+    private fun addSlot() {
+        val list = Slot.load(prefs).toMutableList()
+        // Новый отрезок начинается там, где кончился последний, и длится 2 часа
+        val start = list.lastOrNull()?.to ?: 9 * 60
+        list += Slot(start, (start + 120) % (24 * 60), 0x7F)
+        Slot.save(prefs, list)
+        rebuildSlots()
+    }
+
+    private fun removeSlot(i: Int) {
+        val list = Slot.load(prefs).toMutableList()
+        if (i !in list.indices) return
+        list.removeAt(i)
+        Slot.save(prefs, list)
+        rebuildSlots()
+    }
+
+    private fun slotView(i: Int, slot: Slot): View {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            background = GradientDrawable().apply {
+                setColor(BG)
+                cornerRadius = dp(8).toFloat()
+                setStroke(dp(1), LINE)
+            }
+        }
+        val times = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        lateinit var fromBtn: Button
+        lateinit var toBtn: Button
+        fromBtn = button(fmtTime(slot.from)) {
+            pickTime(Slot.load(prefs).getOrNull(i)?.from ?: slot.from) { m ->
+                updateSlot(i) { it.copy(from = m) }
+                fromBtn.text = fmtTime(m)
+            }
+        }
+        toBtn = button(fmtTime(slot.to)) {
+            pickTime(Slot.load(prefs).getOrNull(i)?.to ?: slot.to) { m ->
+                updateSlot(i) { it.copy(to = m) }
+                toBtn.text = fmtTime(m)
+            }
+        }
+        times.addView(tv("С", 15f, TEXT))
+        times.addView(fromBtn, LinearLayout.LayoutParams(0, wrap, 1f).apply { leftMargin = dp(8); rightMargin = dp(12) })
+        times.addView(tv("до", 15f, TEXT))
+        times.addView(toBtn, LinearLayout.LayoutParams(0, wrap, 1f).apply { leftMargin = dp(8); rightMargin = dp(8) })
+        times.addView(button("✕", PANEL, MUTED) { removeSlot(i) })
+        box.addView(times)
+
+        val dayRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        for ((name, bit) in DAYS) {
+            val tb = dayToggle(name, (slot.days and (1 shl bit)) != 0) { c ->
+                updateSlot(i) { it.copy(days = if (c) it.days or (1 shl bit) else it.days and (1 shl bit).inv()) }
+            }
+            dayRow.addView(tb, LinearLayout.LayoutParams(0, wrap, 1f).apply { leftMargin = dp(2); rightMargin = dp(2) })
+        }
+        box.addView(dayRow, lp(8))
+        return box
+    }
+
+    private fun dayToggle(name: String, checked: Boolean, onChange: (Boolean) -> Unit): ToggleButton =
+        ToggleButton(this).apply {
+            textOn = name
+            textOff = name
+            textSize = 13f
+            minWidth = 0
+            minimumWidth = 0
+            minHeight = 0
+            minimumHeight = 0
+            setPadding(0, dp(10), 0, dp(10))
+            stateListAnimator = null
+            background = StateListDrawable().apply {
+                addState(intArrayOf(android.R.attr.state_checked), GradientDrawable().apply {
+                    setColor(ACCENT); cornerRadius = dp(6).toFloat()
+                })
+                addState(intArrayOf(), GradientDrawable().apply {
+                    setColor(PANEL); setStroke(dp(1), LINE); cornerRadius = dp(6).toFloat()
+                })
+            }
+            setTextColor(
+                ColorStateList(
+                    arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                    intArrayOf(DARK, MUTED)
+                )
+            )
+            isChecked = checked
+            setOnCheckedChangeListener { _, c -> onChange(c) }
+        }
+
+    private fun pickTime(v: Int, done: (Int) -> Unit) {
+        TimePickerDialog(this, { _, h, m -> done(h * 60 + m) }, v / 60, v % 60, true).show()
     }
 
     private fun pickFile() {
@@ -506,13 +569,18 @@ class MainActivity : Activity() {
 
     private fun schedText(c: Cfg): String {
         if (!c.schedOn) return "Расписание выключено: реагирует круглосуточно."
-        if (c.days == 0) return "Не выбран ни один день: реагировать не будет."
-        val span = if (c.from == c.to) "весь день"
-        else fmtTime(c.from) + "–" + fmtTime(c.to) + (if (c.from > c.to) " (через полночь)" else "")
-        val days = if (c.days == 0x7F) "каждый день"
-        else "дни: " + DAYS.filter { (c.days and (1 shl it.second)) != 0 }.joinToString(", ") { it.first }
+        val slots = c.slots.filter { it.days != 0 }
+        if (slots.isEmpty()) return "Не задано ни одного отрезка с днями: реагировать не будет."
         val now = if (c.inWindow()) "Сейчас в расписании." else "Сейчас вне расписания."
-        return "$now Работает $span, $days."
+        return "$now Работает:\n" + slots.joinToString("\n") { "• " + slotText(it) }
+    }
+
+    private fun slotText(s: Slot): String {
+        val span = if (s.from == s.to) "весь день"
+        else fmtTime(s.from) + "–" + fmtTime(s.to) + (if (s.from > s.to) " (через полночь)" else "")
+        val days = if (s.days == 0x7F) "каждый день"
+        else DAYS.filter { (s.days and (1 shl it.second)) != 0 }.joinToString(", ") { it.first }
+        return "$span, $days"
     }
 
     // ---------- Построение интерфейса ----------
