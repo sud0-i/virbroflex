@@ -14,24 +14,9 @@ val DAYS = listOf("Пн" to 1, "Вт" to 2, "Ср" to 3, "Чт" to 4, "Пт" to 
 
 fun fmtTime(m: Int): String = "%02d:%02d".format(m / 60, m % 60)
 
-data class Cfg(
-    val thr: Int,
-    val attackMs: Long,
-    val holdMs: Long,
-    val coolMs: Long,
-    val freq: Int,
-    val vol: Float,
-    val mode: String,
-    val schedOn: Boolean,
-    val from: Int,
-    val to: Int,
-    val days: Int,
-    val fileUri: String?,
-    val dirUri: String?,
-    val trackSrc: String
-) {
-    fun inWindow(c: Calendar = Calendar.getInstance()): Boolean {
-        if (!schedOn) return true
+/** Отрезок расписания: с from до to (минуты от полуночи) в отмеченные дни (биты по DAYS). */
+data class Slot(val from: Int, val to: Int, val days: Int) {
+    fun covers(c: Calendar): Boolean {
         val dow = c.get(Calendar.DAY_OF_WEEK) - 1
         val m = c.get(Calendar.HOUR_OF_DAY) * 60 + c.get(Calendar.MINUTE)
         fun on(d: Int) = (days and (1 shl d)) != 0
@@ -45,6 +30,40 @@ data class Cfg(
     }
 
     companion object {
+        /** Отрезки хранятся строкой «from-to-days;from-to-days». */
+        fun load(p: SharedPreferences): List<Slot> {
+            val raw = p.getString("slots", null)
+                // Старые настройки: один отрезок
+                ?: return listOf(Slot(p.getInt("from", 9 * 60), p.getInt("to", 14 * 60), p.getInt("days", 0x7F)))
+            return raw.split(';').mapNotNull { part ->
+                val f = part.split('-').mapNotNull { it.toIntOrNull() }
+                if (f.size == 3) Slot(f[0], f[1], f[2]) else null
+            }
+        }
+
+        fun save(p: SharedPreferences, list: List<Slot>) {
+            p.edit().putString("slots", list.joinToString(";") { "${it.from}-${it.to}-${it.days}" }).apply()
+        }
+    }
+}
+
+data class Cfg(
+    val thr: Int,
+    val attackMs: Long,
+    val holdMs: Long,
+    val coolMs: Long,
+    val freq: Int,
+    val vol: Float,
+    val mode: String,
+    val schedOn: Boolean,
+    val slots: List<Slot>,
+    val fileUri: String?,
+    val dirUri: String?,
+    val trackSrc: String
+) {
+    fun inWindow(c: Calendar = Calendar.getInstance()): Boolean = !schedOn || slots.any { it.covers(c) }
+
+    companion object {
         fun load(p: SharedPreferences) = Cfg(
             thr = p.getInt("thr", -40),
             attackMs = p.getInt("attack10", 5) * 100L,
@@ -54,9 +73,7 @@ data class Cfg(
             vol = p.getInt("vol", 80) / 100f,
             mode = p.getString("mode", "sine") ?: "sine",
             schedOn = p.getBoolean("schedOn", false),
-            from = p.getInt("from", 9 * 60),
-            to = p.getInt("to", 14 * 60),
-            days = p.getInt("days", 0x7F),
+            slots = Slot.load(p),
             fileUri = p.getString("fileUri", null),
             dirUri = p.getString("dirUri", null),
             trackSrc = p.getString("trackSrc", "file") ?: "file"
