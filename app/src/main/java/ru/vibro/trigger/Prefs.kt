@@ -22,12 +22,13 @@ data class Cfg(
     val freq: Int,
     val vol: Float,
     val mode: String,
-    val hp: Boolean,
     val schedOn: Boolean,
     val from: Int,
     val to: Int,
     val days: Int,
-    val fileUri: String?
+    val fileUri: String?,
+    val dirUri: String?,
+    val trackSrc: String
 ) {
     fun inWindow(c: Calendar = Calendar.getInstance()): Boolean {
         if (!schedOn) return true
@@ -52,12 +53,13 @@ data class Cfg(
             freq = p.getInt("freq", 60),
             vol = p.getInt("vol", 80) / 100f,
             mode = p.getString("mode", "sine") ?: "sine",
-            hp = p.getBoolean("hp", true),
             schedOn = p.getBoolean("schedOn", false),
             from = p.getInt("from", 9 * 60),
             to = p.getInt("to", 14 * 60),
             days = p.getInt("days", 0x7F),
-            fileUri = p.getString("fileUri", null)
+            fileUri = p.getString("fileUri", null),
+            dirUri = p.getString("dirUri", null),
+            trackSrc = p.getString("trackSrc", "file") ?: "file"
         )
     }
 }
