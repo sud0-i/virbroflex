@@ -19,7 +19,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
-import android.provider.OpenableColumns
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
@@ -61,7 +60,7 @@ class MainActivity : Activity() {
     private lateinit var settingsBtn: Button
     private lateinit var statsText: TextView
     private lateinit var schedInfo: TextView
-    private lateinit var fileName: TextView
+    private lateinit var trackInfo: TextView
 
     private val match = ViewGroup.LayoutParams.MATCH_PARENT
     private val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
@@ -118,17 +117,14 @@ class MainActivity : Activity() {
 
         // Звук
         val sound = panel(root, "Что включать")
-        val fileRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
+        val fileRow = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val cur = prefs.getString("mode", "sine")
         val rg = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
         val modes = listOf(
             "sine" to "Ровный тон",
             "pulse" to "Импульсы (1 с звук, 0,7 с пауза)",
             "sweep" to "Плавание частоты ±8 Гц",
-            "file" to "Свой аудиофайл по кругу"
+            "file" to "Свои треки (папка вперемешку или один файл)"
         )
         for ((key, name) in modes) {
             val rb = RadioButton(this).apply {
@@ -148,9 +144,19 @@ class MainActivity : Activity() {
         }
         sound.addView(rg, lp(6))
 
-        fileName = tv(prefs.getString("fileName", null) ?: "Файл не выбран", 13f, MUTED)
-        fileRow.addView(button("Выбрать файл") { pickFile() })
-        fileRow.addView(fileName, LinearLayout.LayoutParams(0, wrap, 1f).apply { leftMargin = dp(12) })
+        val pickRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        pickRow.addView(
+            button("Выбрать папку") { pickFolder() },
+            LinearLayout.LayoutParams(0, wrap, 1f).apply { rightMargin = dp(6) }
+        )
+        pickRow.addView(
+            button("Выбрать файл") { pickFile() },
+            LinearLayout.LayoutParams(0, wrap, 1f).apply { leftMargin = dp(6) }
+        )
+        fileRow.addView(pickRow)
+        trackInfo = tv("", 13f, MUTED)
+        fileRow.addView(trackInfo, lp(8))
+        updateTrackInfo()
         fileRow.visibility = if (cur == "file") View.VISIBLE else View.GONE
         sound.addView(fileRow, lp(8))
 
@@ -174,7 +180,13 @@ class MainActivity : Activity() {
         slider(trig, "Шум должен длиться", "attack10", 1, 50, 5) { "%.1f с".format(it / 10.0) }
         slider(trig, "Играть после тишины ещё", "hold", 2, 300, 20) { fmtSec(it) }
         slider(trig, "Пауза между срабатываниями", "cool", 0, 120, 5) { "$it с" }
-        trig.addView(check("Не слышать свою колонку (фильтр ниже 200 Гц на микрофоне)", "hp", true), lp(12))
+        trig.addView(
+            tv(
+                "Пока звучит тон, микрофон не слышит частоты ниже 200 Гц, чтобы колонка не продлевала сама себя. " +
+                    "Во время своих треков колонка раз в 15 с затихает на секунду и слушает, шумят ли ещё.",
+                12f, MUTED
+            ), lp(12)
+        )
 
         // Расписание
         val sch = panel(root, "Расписание")
@@ -365,25 +377,76 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun pickFolder() {
+        try {
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_DIR)
+        } catch (e: Exception) {
+            uiErr = "На телефоне не нашлось выбора папок."
+        }
+    }
+
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != REQ_FILE || resultCode != RESULT_OK) return
+        if (resultCode != RESULT_OK) return
         val uri = data?.data ?: return
+        when (requestCode) {
+            REQ_FILE -> {
+                keepAccess(uri, "fileUri")
+                val name = Tracks.name(this, uri) ?: "Файл"
+                prefs.edit().putString("fileUri", uri.toString()).putString("fileName", name)
+                    .putString("trackSrc", "file").apply()
+            }
+            REQ_DIR -> {
+                keepAccess(uri, "dirUri")
+                val name = Tracks.treeName(this, uri) ?: "Папка"
+                prefs.edit().putString("dirUri", uri.toString()).putString("dirName", name)
+                    .putString("trackSrc", "dir").apply()
+            }
+            else -> return
+        }
+        uiErr = null
+        updateTrackInfo()
+    }
+
+    /** Запоминает доступ к новому файлу/папке и отпускает старый — у Android лимит на такие разрешения. */
+    private fun keepAccess(uri: Uri, key: String) {
         try {
             contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
         } catch (e: Exception) {
         }
-        val name = displayName(uri)
-        prefs.edit().putString("fileUri", uri.toString()).putString("fileName", name).apply()
-        fileName.text = name
+        val old = prefs.getString(key, null) ?: return
+        if (old == uri.toString()) return
+        try {
+            contentResolver.releasePersistableUriPermission(Uri.parse(old), Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (e: Exception) {
+        }
     }
 
-    private fun displayName(uri: Uri): String = try {
-        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
-            if (c.moveToFirst()) c.getString(0) else null
-        } ?: "Файл выбран"
-    } catch (e: Exception) {
-        "Файл выбран"
+    private fun updateTrackInfo() {
+        val dir = prefs.getString("dirUri", null)
+        if (prefs.getString("trackSrc", "file") == "dir" && dir != null) {
+            val name = prefs.getString("dirName", null) ?: "Папка"
+            trackInfo.text = "Папка «$name»: ищу треки…"
+            Thread {
+                val text = try {
+                    val n = Tracks.scan(applicationContext, Uri.parse(dir)).size
+                    if (n == 0) "Папка «$name»: аудиофайлов не найдено."
+                    else "Папка «$name»: треков — $n. При каждом срабатывании играют в случайном порядке."
+                } catch (e: Exception) {
+                    "Папка «$name»: нет доступа, выберите её заново."
+                }
+                ui.post {
+                    // Пока сканировали, могли выбрать другое
+                    if (!isDestroyed && prefs.getString("dirUri", null) == dir &&
+                        prefs.getString("trackSrc", "file") == "dir"
+                    ) trackInfo.text = text
+                }
+            }.start()
+            return
+        }
+        val file = prefs.getString("fileName", null)
+        trackInfo.text = if (prefs.getString("fileUri", null) != null) "Файл: ${file ?: "выбран"} (по кругу)"
+        else "Ничего не выбрано — будет играть обычный тон."
     }
 
     private fun askBattery() {
@@ -541,6 +604,7 @@ class MainActivity : Activity() {
     companion object {
         const val REQ_PERM = 1
         const val REQ_FILE = 2
+        const val REQ_DIR = 3
     }
 }
 

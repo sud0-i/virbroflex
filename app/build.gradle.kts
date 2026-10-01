@@ -11,8 +11,10 @@ android {
         applicationId = "ru.vibro.trigger"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        // Номер сборки GitHub Actions, чтобы каждая новая сборка была новее предыдущей
+        val build = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
+        versionCode = build
+        versionName = "1.$build"
     }
 
     // Постоянный ключ, чтобы новые сборки ставились поверх старых без удаления

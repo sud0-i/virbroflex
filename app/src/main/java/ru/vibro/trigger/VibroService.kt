@@ -8,10 +8,8 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
-import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
@@ -25,7 +23,6 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.log10
 import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.sqrt
 
 /** Фоновая служба: слушает микрофон и включает звук. */
@@ -36,15 +33,24 @@ class VibroService : Service() {
     private val main = Handler(Looper.getMainLooper())
     private var wake: PowerManager.WakeLock? = null
 
-    // Файловый режим
-    @Volatile private var player: MediaPlayer? = null
-    @Volatile private var fileStarting = false
-    @Volatile private var fileTarget = 0f
-    private var fileGain = 0f
+    private val player by lazy { TrackPlayer(this) }
 
     // Состояние логики (только поток worker)
     private var playingMode = ""
+    private var usingTone = false
     private var lastStop = -1_000_000L
+    private var filterUntil = 0L
+
+    // Проверка тишины во время своих треков
+    private var lastCheck = 0L
+    private var checkStart = 0L
+    private var muteAt = 0L
+    private var checkLoud = 0
+
+    // Кэш списка треков папки
+    private var scanKey = ""
+    private var scanAt = -1_000_000L
+    private var scanList: List<Uri> = emptyList()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -71,14 +77,7 @@ class VibroService : Service() {
         worker?.join(2000)
         worker = null
         tone.shutdown()
-        player?.let {
-            try {
-                it.stop()
-            } catch (e: Exception) {
-            }
-            it.release()
-        }
-        player = null
+        player.shutdown()
         wake?.let { if (it.isHeld) it.release() }
         VibroState.running = false
         VibroState.playing = false
@@ -171,15 +170,19 @@ class VibroService : Service() {
                 if (now - cfgAt > 500) {
                     cfg = Cfg.load(prefs)
                     cfgAt = now
-                    val hf = if (cfg.hp) 200.0 else 10.0
-                    if (hf != hpFreq) {
-                        hpf.highpass(hf, fs.toDouble())
-                        hpFreq = hf
-                    }
                     tone.freq = cfg.freq.toDouble()
                     tone.vol = cfg.vol
                     tone.mode = cfg.mode
-                    if (VibroState.playing && playingMode == "file") fileTarget = cfg.vol
+                    if (VibroState.playing && !usingTone) player.target = cfg.vol
+                }
+
+                // Пока звучит тон (и секунду после), низ отрезаем, чтобы колонка не продлевала сама себя.
+                // В остальное время слушаем всё: топот и удары как раз ниже 200 Гц.
+                val hf = if ((VibroState.playing && usingTone) || now < filterUntil) 200.0 else 10.0
+                if (hf != hpFreq) {
+                    hpf.highpass(hf, fs.toDouble())
+                    hpf.reset()
+                    hpFreq = hf
                 }
 
                 // Уровень после фильтра
@@ -200,9 +203,9 @@ class VibroService : Service() {
                     aboveSince = 0L
                 }
                 val sustained = aboveSince != 0L && now - aboveSince >= cfg.attackMs
-                // Аудиофайл микрофон слышит сам — во время файла шум не продлевает звук
-                val selfHearing = VibroState.playing && playingMode == "file"
-                if (sustained && !selfHearing) lastLoud = now
+                // Свои треки микрофон слышит сам — шум ловим только в паузах-проверках
+                val tracksOn = VibroState.playing && !usingTone
+                if (sustained && !tracksOn) lastLoud = now
 
                 if (VibroState.testRequest) {
                     VibroState.testRequest = false
@@ -227,9 +230,14 @@ class VibroService : Service() {
                     lastLoud = now
                     startPlay(cfg, now)
                 }
-                if (VibroState.playing && !testing && now - lastLoud > cfg.holdMs) stopPlay(now)
-
-                stepFileFade()
+                if (VibroState.playing && !testing) {
+                    if (usingTone) {
+                        if (now - lastLoud > cfg.holdMs) stopPlay(now)
+                    } else {
+                        lastLoud = checkStep(cfg, now, smooth, lastLoud)
+                        if (!VibroState.playing) aboveSince = 0L
+                    }
+                }
             }
         } catch (e: InterruptedException) {
         } finally {
@@ -244,77 +252,95 @@ class VibroService : Service() {
         }
     }
 
+    /**
+     * Своих треков микрофон не отличает от соседей, поэтому раз в CHECK_EVERY (и перед остановкой)
+     * колонка на секунду затихает, и мы слушаем тишину. Шумно — играем дальше, тихо и время вышло — стоп.
+     * Возвращает новое время последнего шума.
+     */
+    private fun checkStep(cfg: Cfg, now: Long, level: Float, lastLoud: Long): Long {
+        if (checkStart == 0L) {
+            if (now - lastLoud > cfg.holdMs || now - lastCheck > CHECK_EVERY) {
+                checkStart = now
+                muteAt = 0L
+                checkLoud = 0
+                player.duck = true
+            }
+            return lastLoud
+        }
+        if (muteAt == 0L && (player.gain == 0f || now - checkStart > 1500)) muteAt = now
+        if (muteAt == 0L || now - muteAt < CHECK_SETTLE) return lastLoud
+        if (level > cfg.thr) checkLoud++
+        if (now - muteAt < CHECK_SETTLE + CHECK_LISTEN) return lastLoud
+
+        // Проверка окончена: ~3 блока (0,15 с) выше порога — значит, шумят
+        val loud = if (checkLoud >= 3) now else lastLoud
+        checkStart = 0L
+        lastCheck = now
+        if (now - loud > cfg.holdMs) stopPlay(now) else player.duck = false
+        return loud
+    }
+
     private fun startPlay(cfg: Cfg, now: Long) {
+        VibroState.error = null
         VibroState.playing = true
         VibroState.playStart = now
         playingMode = cfg.mode
-        if (cfg.mode == "file") startFile(cfg) else tone.start()
+        lastCheck = now
+        checkStart = 0L
+        usingTone = cfg.mode != "file" || !startTracks(cfg, now)
+        if (usingTone) tone.start()
     }
 
     private fun stopPlay(now: Long) {
         VibroState.playMs += now - VibroState.playStart
         VibroState.playing = false
         lastStop = now
+        if (usingTone) filterUntil = now + 1000
+        checkStart = 0L
         tone.stop()
-        fileTarget = 0f
+        player.stop()
     }
 
-    private fun startFile(cfg: Cfg) {
-        val u = cfg.fileUri
-        if (u == null) {
-            VibroState.error = "Файл не выбран — играет обычный тон."
-            tone.start()
-            return
-        }
-        fileTarget = cfg.vol
-        if (player != null || fileStarting) return
-        fileStarting = true
-        main.post {
-            try {
-                val mp = MediaPlayer()
-                mp.setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build()
-                )
-                mp.setDataSource(this, Uri.parse(u))
-                mp.isLooping = true
-                mp.prepare()
-                mp.setVolume(0f, 0f)
-                mp.start()
-                fileGain = 0f
-                player = mp
-            } catch (e: Exception) {
-                VibroState.error = "Не удалось воспроизвести файл: ${e.message}"
-            } finally {
-                fileStarting = false
-            }
-        }
-    }
-
-    /** Плавная громкость файла, ~1 с на полное нарастание/затухание. */
-    private fun stepFileFade() {
-        val mp = player ?: return
-        val step = 0.05f
-        fileGain = if (fileGain < fileTarget) min(fileTarget, fileGain + step) else max(fileTarget, fileGain - step)
-        try {
-            mp.setVolume(fileGain, fileGain)
-        } catch (e: Exception) {
-        }
-        if (fileTarget == 0f && fileGain == 0f) {
-            player = null
-            main.post {
+    /** Запускает свои треки. false — играть нечего, вместо них будет тон. */
+    private fun startTracks(cfg: Cfg, now: Long): Boolean {
+        val dir = cfg.dirUri
+        val list: List<Uri>
+        val key: String
+        if (cfg.trackSrc == "dir" && dir != null) {
+            key = dir
+            if (key != scanKey || now - scanAt > 60_000) {
                 try {
-                    mp.stop()
+                    scanList = Tracks.scan(this, Uri.parse(dir))
                 } catch (e: Exception) {
+                    VibroState.error = "Нет доступа к папке, выберите её заново. Пока играет обычный тон."
+                    return false
                 }
-                mp.release()
+                scanKey = key
+                scanAt = now
             }
+            list = scanList
+            if (list.isEmpty()) {
+                VibroState.error = "В папке нет аудиофайлов. Пока играет обычный тон."
+                return false
+            }
+        } else {
+            val f = cfg.fileUri
+            if (f == null) {
+                VibroState.error = "Треки не выбраны. Пока играет обычный тон."
+                return false
+            }
+            key = f
+            list = listOf(Uri.parse(f))
         }
+        player.start(list, key, cfg.vol)
+        return true
     }
 
     companion object {
         const val CHANNEL = "listen"
+
+        const val CHECK_EVERY = 15_000L  // как часто проверять тишину во время треков
+        const val CHECK_SETTLE = 300L    // после заглушения ждём, пока утихнет эхо
+        const val CHECK_LISTEN = 1000L   // сколько слушать
     }
 }
